@@ -452,12 +452,14 @@ function renderVideo() {
       'Szukam zwrotów, które naprawdę się przydają…',
       'Tłumaczę je w kontekście…',
       'Jeszcze chwilka — dłuższe filmiki trwają dłużej.',
+      'Gemini jest teraz zatłoczony — ponawiam sam. Możesz oglądać, wynik się zapisze.',
     ];
+    const tipAt = sec => tips[sec < 15 ? 0 : sec < 35 ? 1 : sec < 60 ? 2 : sec < 100 ? 3 : 4];
     app.innerHTML = `${header}
       <section class="panel loading">
         <div class="spinner big"></div>
         <h2 data-tip>${tips[0]}</h2>
-        <p class="muted"><span data-sec>0</span> s · zwykle 20–90 s</p>
+        <p class="muted"><span data-sec>0</span> s · zwykle 30–90 s</p>
         <p class="hint">Możesz wyjść i oglądać filmik — gdy wrócisz, zwroty będą czekać.</p>
       </section>`;
     const started = state.inflight.startedAt;
@@ -467,7 +469,7 @@ function renderVideo() {
       const secEl = app.querySelector('[data-sec]');
       const tipEl = app.querySelector('[data-tip]');
       if (secEl) secEl.textContent = sec;
-      if (tipEl) tipEl.textContent = tips[Math.min(tips.length - 1, Math.floor(sec / 15))];
+      if (tipEl) tipEl.textContent = tipAt(sec);
     }, 1000);
   } else if (v.phase === 'error') {
     app.innerHTML = `${header}

@@ -1,5 +1,5 @@
 // Najpierw sieć (świeża wersja apki), a bez internetu — kopia z pamięci, żeby powtórki działały offline.
-const CACHE = 'fr-clips-v3';
+const CACHE = 'fr-clips-v4';
 const SHELL = [
   './', './index.html', './app.css', './manifest.webmanifest',
   './js/app.js', './js/db.js', './js/srs.js', './js/gemini.js', './js/youtube.js',

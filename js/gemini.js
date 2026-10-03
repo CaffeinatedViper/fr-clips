@@ -3,9 +3,9 @@ import { watchUrl } from './youtube.js';
 
 const API = 'https://generativelanguage.googleapis.com/v1beta';
 export const DEFAULT_MODEL = 'gemini-3.8-flash';
-// Gdy model jest przeciążony albo wyczerpał limit, próbujemy kolejnego (darmowe limity są osobne dla każdego modelu).
-const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.5-flash', 'gemini-2.5-flash'];
-const RETRYABLE = new Set(['model', 'busy', 'quota']);
+// Tylko modele, które w testach podawały dobre znaczniki czasu (±kilka s).
+// gemini-3.5-flash systematycznie się myli (~×1,6), więc lepiej poczekać na wolny model niż dać złe fragmenty.
+const GOOD_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest'];
 
 const SCHEMA = {
   type: 'OBJECT',
@@ -110,7 +110,8 @@ function extractJson(data) {
 }
 
 const ATTEMPT_TIMEOUT = 90000;  // jeden model może „zawisnąć” — wtedy próbujemy następnego
-const TOTAL_TIMEOUT = 240000;
+const TOTAL_TIMEOUT = 6 * 60000; // przy przeciążeniu ponawiamy w tle (i tak trwa to podczas oglądania)
+const BACKOFF = [10000, 20000, 30000, 45000];
 const MAX_SECONDS = 25 * 60;    // dłuższe filmy: analizujemy tylko początek
 
 export async function analyzeVideo({ videoId, key, model, count, known }) {
@@ -133,36 +134,49 @@ export async function analyzeVideo({ videoId, key, model, count, known }) {
     },
   };
 
-  const models = [model || DEFAULT_MODEL, ...FALLBACK_MODELS.filter(m => m !== model)];
+  const first = model || DEFAULT_MODEL;
+  let models = [first, ...GOOD_MODELS.filter(m => m !== first)];
   let lastErr;
-  for (const m of models) {
-    const left = deadline - Date.now();
-    if (left < 10000) break;
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), Math.min(ATTEMPT_TIMEOUT, left));
-    try {
-      const config = { ...body.generationConfig };
-      let data;
-      try {
-        data = await call(m, key, { ...body, generationConfig: config }, ctrl.signal);
-      } catch (e) {
-        // Model może nie znać któregoś z ustawień — ponów bez nich.
-        if (e.code === 'INVALID_ARGUMENT' && /media/i.test(e.message)) {
-          delete config.mediaResolution;
-          data = await call(m, key, { ...body, generationConfig: config }, ctrl.signal);
-        } else throw e;
-      }
-      const result = extractJson(data);
-      return { ...result, model: m, items: cleanItems(result.items) };
-    } catch (e) {
-      lastErr = e;
-      if (!RETRYABLE.has(e.code) && e.code !== 'timeout') throw e;
-      if (e.code === 'busy') await new Promise(r => setTimeout(r, 1500));
-    } finally {
-      clearTimeout(timer);
+  for (let round = 0; models.length; round++) {
+    if (round > 0) {
+      const wait = BACKOFF[Math.min(round - 1, BACKOFF.length - 1)];
+      if (Date.now() + wait > deadline - 10000) break;
+      await new Promise(r => setTimeout(r, wait));
+    }
+    for (const m of [...models]) {
+      const left = deadline - Date.now();
+      if (left < 10000) break;
+      const res = await attempt(m, key, body, left).catch(e => e);
+      if (!(res instanceof Error)) return res;
+      lastErr = res;
+      // Limit dzienny albo brak modelu: ten model odpada do końca analizy.
+      if (res.code === 'quota' || res.code === 'model') models = models.filter(x => x !== m);
+      else if (res.code !== 'busy' && res.code !== 'timeout') throw res;
     }
   }
   throw lastErr || new GeminiError('Analiza trwała za długo. Spróbuj jeszcze raz.', 'timeout');
+}
+
+async function attempt(m, key, body, left) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), Math.min(ATTEMPT_TIMEOUT, left));
+  try {
+    const config = { ...body.generationConfig };
+    let data;
+    try {
+      data = await call(m, key, { ...body, generationConfig: config }, ctrl.signal);
+    } catch (e) {
+      // Model może nie znać któregoś z ustawień — ponów bez nich.
+      if (e.code === 'INVALID_ARGUMENT' && /media/i.test(e.message)) {
+        delete config.mediaResolution;
+        data = await call(m, key, { ...body, generationConfig: config }, ctrl.signal);
+      } else throw e;
+    }
+    const result = extractJson(data);
+    return { ...result, model: m, items: cleanItems(result.items) };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function cleanItems(items) {
