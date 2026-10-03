@@ -1,7 +1,7 @@
 import { cards as cardStore, kv } from './db.js';
 import { newSrs, grade, preview, GRADES } from './srs.js';
 import { analyzeVideo, testKey, DEFAULT_MODEL } from './gemini.js';
-import { findVideoId, thumbUrl, embedUrl, appUrlAt, formatTime } from './youtube.js';
+import { findVideoId, thumbUrl, embedUrl, appUrlAt, formatTime, videoInfo } from './youtube.js';
 
 const DEFAULT_SETTINGS = { apiKey: '', model: DEFAULT_MODEL, maxAdd: 8, candidates: 15, maxReviews: 60 };
 const LEARNING_WINDOW = 20 * 60 * 1000; // karty z krótkim interwałem wracają w tej samej sesji
@@ -80,8 +80,13 @@ function speak(text) {
   speechSynthesis.speak(u);
 }
 
-function openClip(videoId, t) {
+function openClip(videoId, t, embed = true) {
   closeClip();
+  // Film z zablokowanym osadzaniem: od razu do aplikacji YouTube, w odpowiednim momencie.
+  if (embed === false) {
+    window.open(appUrlAt(videoId, t), '_blank', 'noopener');
+    return;
+  }
   const el = document.createElement('div');
   el.className = 'clip';
   el.innerHTML = `
@@ -262,7 +267,7 @@ function renderOnboarding() {
         <li>Wklej go poniżej.</li>
       </ol>
       <form data-form="key">
-        <input name="key" type="password" placeholder="Klucz Gemini (AIza…)" autocomplete="off">
+        <input name="key" type="password" placeholder="Klucz Gemini" autocomplete="off">
         <button class="btn big" type="submit">Zapisz i zaczynamy</button>
       </form>
     </section>`;
@@ -353,7 +358,7 @@ function renderReview() {
 
   app.querySelector('[data-action="home"]').addEventListener('click', () => { state.review = null; go('home'); });
   app.querySelector('[data-action="speak"]').addEventListener('click', e => { e.stopPropagation(); speak(r.back ? card.sfr || card.fr : card.fr); });
-  app.querySelector('[data-action="clip"]')?.addEventListener('click', e => { e.stopPropagation(); openClip(card.vid, card.t); });
+  app.querySelector('[data-action="clip"]')?.addEventListener('click', e => { e.stopPropagation(); openClip(card.vid, card.t, card.embed); });
   const flip = () => { if (!r.back) { r.back = true; render(); } };
   app.querySelector('[data-action="flip"]').addEventListener('click', flip);
   app.querySelector('[data-action="show"]')?.addEventListener('click', flip);
@@ -408,6 +413,7 @@ async function startAnalysis(videoId) {
 
   try {
     const known = state.cards.slice(-400).map(c => c.fr);
+    const infoPromise = videoInfo(videoId);
     const result = await analyzeVideo({
       videoId,
       key: state.settings.apiKey,
@@ -419,7 +425,8 @@ async function startAnalysis(videoId) {
     const knownSet = new Set(state.cards.map(c => normalize(c.fr)));
     const items = result.items.filter(i => !knownSet.has(normalize(i.fr)));
     if (!items.length) throw new Error('Nie znalazłem nowych zwrotów w tym filmiku. Spróbuj innego.');
-    state.pending = { videoId, title: result.title || 'Filmik', items, createdAt: Date.now() };
+    const info = await infoPromise;
+    state.pending = { videoId, title: info.title || result.title || 'Filmik', embed: info.embed, items, createdAt: Date.now() };
     await kv.set('pending', state.pending);
     state.video = { phase: 'results', selected: new Set() };
     if (state.screen !== 'video') toast('Zwroty z filmiku są gotowe ✓');
@@ -528,7 +535,7 @@ function renderResults(header) {
   }));
   app.querySelectorAll('[data-clip]').forEach(b => b.addEventListener('click', e => {
     e.stopPropagation();
-    openClip(p.videoId, p.items[+b.dataset.clip].t);
+    openClip(p.videoId, p.items[+b.dataset.clip].t, p.embed);
   }));
   app.querySelector('[data-action="add"]').addEventListener('click', addSelected);
   const discard = app.querySelector('[data-action="discard"]');
@@ -553,7 +560,7 @@ async function addSelected() {
     return {
       id: `${now.toString(36)}-${n}-${Math.random().toString(36).slice(2, 7)}`,
       fr: it.fr, pl: it.pl, sfr: it.sentence_fr, spl: it.sentence_pl, match: it.match,
-      note: it.note, level: it.level, vid: p.videoId, t: it.t, title: p.title,
+      note: it.note, level: it.level, vid: p.videoId, t: it.t, title: p.title, embed: p.embed,
       created: now,
       srs: newSrs(new Date(now)),
     };
@@ -609,7 +616,7 @@ function renderDeck() {
   });
   app.querySelectorAll('[data-clip]').forEach(b => b.addEventListener('click', () => {
     const c = state.cards.find(x => x.id === b.dataset.clip);
-    openClip(c.vid, c.t);
+    openClip(c.vid, c.t, c.embed);
   }));
   app.querySelectorAll('[data-del]').forEach(b => b.addEventListener('click', async () => {
     if (!b.dataset.armed) {

@@ -2,8 +2,10 @@
 import { watchUrl } from './youtube.js';
 
 const API = 'https://generativelanguage.googleapis.com/v1beta';
-export const DEFAULT_MODEL = 'gemini-flash-latest';
-const FALLBACK_MODELS = ['gemini-flash-latest', 'gemini-3.8-flash', 'gemini-3.5-flash'];
+export const DEFAULT_MODEL = 'gemini-3.8-flash';
+// Gdy model jest przeciążony albo wyczerpał limit, próbujemy kolejnego (darmowe limity są osobne dla każdego modelu).
+const FALLBACK_MODELS = ['gemini-3.8-flash', 'gemini-flash-latest', 'gemini-3.5-flash', 'gemini-2.5-flash'];
+const RETRYABLE = new Set(['model', 'busy', 'quota']);
 
 const SCHEMA = {
   type: 'OBJECT',
@@ -34,7 +36,7 @@ const SCHEMA = {
 function buildPrompt(count, known) {
   const knownList = known.length ? known.join(' | ') : '(brak)';
   return `You help a native Polish speaker (French level B1/B2) learn French from this YouTube video.
-Listen to the French speech in the video and pick the ${count} most useful expressions to learn.
+Listen to the French speech in the video (only the first 25 minutes are provided for long videos) and pick the ${count} most useful expressions to learn.
 
 Prefer: multi-word expressions, idioms, collocations, verb + preposition constructions, colloquial phrases people really say, and useful B1–C1 vocabulary — all actually spoken in the video.
 Skip: trivial A1–A2 words, proper names, and anything already in the KNOWN list below.
@@ -80,8 +82,14 @@ async function call(model, key, body, signal) {
     const msg = data.error?.message || `HTTP ${res.status}`;
     const status = data.error?.status || '';
     if (/API key not valid|API_KEY_INVALID/i.test(msg)) throw new GeminiError('Klucz Gemini jest nieprawidłowy. Sprawdź go w ustawieniach.', 'key');
-    if (res.status === 429) throw new GeminiError('Darmowy limit Gemini chwilowo się wyczerpał. Spróbuj za minutę (albo krótszy filmik).', 'quota');
+    if (res.status === 429) {
+      const perDay = /PerDay/i.test(JSON.stringify(data.error?.details || ''));
+      throw new GeminiError(perDay
+        ? 'Dzisiejszy darmowy limit Gemini się wyczerpał. Wróci jutro rano — powtórki działają normalnie.'
+        : 'Darmowy limit Gemini chwilowo się wyczerpał. Spróbuj za minutę.', 'quota');
+    }
     if (res.status === 404) throw new GeminiError(msg, 'model');
+    if (res.status >= 500 || status === 'UNAVAILABLE') throw new GeminiError('Gemini jest teraz przeciążony. Spróbuj za kilka minut.', 'busy');
     throw new GeminiError(msg, status || 'api');
   }
   return data;
@@ -101,13 +109,20 @@ function extractJson(data) {
   }
 }
 
-export async function analyzeVideo({ videoId, key, model, count, known, timeoutMs = 240000 }) {
-  const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+const ATTEMPT_TIMEOUT = 90000;  // jeden model może „zawisnąć” — wtedy próbujemy następnego
+const TOTAL_TIMEOUT = 240000;
+const MAX_SECONDS = 25 * 60;    // dłuższe filmy: analizujemy tylko początek
+
+export async function analyzeVideo({ videoId, key, model, count, known }) {
+  const deadline = Date.now() + TOTAL_TIMEOUT;
   const body = {
     contents: [{
       parts: [
-        { fileData: { fileUri: watchUrl(videoId) } },
+        {
+          fileData: { fileUri: watchUrl(videoId) },
+          // Liczy się mowa, nie obraz: mało klatek = mniej tokenów i szybsza odpowiedź.
+          videoMetadata: { startOffset: '0s', endOffset: `${MAX_SECONDS}s`, fps: 0.25 },
+        },
         { text: buildPrompt(count, known) },
       ],
     }],
@@ -119,31 +134,35 @@ export async function analyzeVideo({ videoId, key, model, count, known, timeoutM
   };
 
   const models = [model || DEFAULT_MODEL, ...FALLBACK_MODELS.filter(m => m !== model)];
-  try {
-    let lastErr;
-    for (const m of models) {
+  let lastErr;
+  for (const m of models) {
+    const left = deadline - Date.now();
+    if (left < 10000) break;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Math.min(ATTEMPT_TIMEOUT, left));
+    try {
+      const config = { ...body.generationConfig };
+      let data;
       try {
-        let data;
-        try {
-          data = await call(m, key, body, ctrl.signal);
-        } catch (e) {
-          // Starsze modele mogą nie znać mediaResolution — ponów bez niego.
-          if (e.code === 'INVALID_ARGUMENT' && /media/i.test(e.message)) {
-            delete body.generationConfig.mediaResolution;
-            data = await call(m, key, body, ctrl.signal);
-          } else throw e;
-        }
-        const result = extractJson(data);
-        return { ...result, model: m, items: cleanItems(result.items) };
+        data = await call(m, key, { ...body, generationConfig: config }, ctrl.signal);
       } catch (e) {
-        lastErr = e;
-        if (e.code !== 'model') throw e;
+        // Model może nie znać któregoś z ustawień — ponów bez nich.
+        if (e.code === 'INVALID_ARGUMENT' && /media/i.test(e.message)) {
+          delete config.mediaResolution;
+          data = await call(m, key, { ...body, generationConfig: config }, ctrl.signal);
+        } else throw e;
       }
+      const result = extractJson(data);
+      return { ...result, model: m, items: cleanItems(result.items) };
+    } catch (e) {
+      lastErr = e;
+      if (!RETRYABLE.has(e.code) && e.code !== 'timeout') throw e;
+      if (e.code === 'busy') await new Promise(r => setTimeout(r, 1500));
+    } finally {
+      clearTimeout(timer);
     }
-    throw lastErr;
-  } finally {
-    clearTimeout(timer);
   }
+  throw lastErr || new GeminiError('Analiza trwała za długo. Spróbuj jeszcze raz.', 'timeout');
 }
 
 function cleanItems(items) {
